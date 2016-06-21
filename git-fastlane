@@ -1,0 +1,202 @@
+#!/bin/bash
+#
+# Fastlane utility to create mergeable branches, push to production, etc..
+# Place in $PATH
+#
+#  `$ git fastlane --help`
+#
+# @author dalvizu
+#
+SCRIPT_VERSION="0.1"
+
+# Trap errors for immediate failout
+trap 'trap_and_exit "${BASH_COMMAND}" $?' ERR
+
+function trap_and_exit(){
+  local LAST_COMMAND=$1
+  local EXIT_CODE=$2
+  echo " ! Found an error while processing request:"
+  echo "Command: ${LAST_COMMAND}"
+  echo "Exit Code: ${EXIT_CODE}"
+  exit 1
+}
+
+# parse command line args
+while [[ $# > 0 ]]
+do
+key="$1"
+
+case $key in
+    -d|--dry-run)
+      DRY_RUN="true"
+      shift # past argument
+    ;;
+    -h|--help)
+      SHOW_HELP="true"
+      shift # past argument
+    ;;
+      -v|--version)
+      PRINT_VERSION="true"
+    shift # past argument
+    ;;
+      -b|--branch)
+      BRANCH="$2"
+    shift
+    shift # past argument
+    ;;
+      -t|--test-jenkins)
+      USE_TEST_JENKINS="true"
+    shift # past argument
+    ;;
+      -f|--force)
+      FORCE="true"
+    shift # past argument
+    ;;
+    *)
+            # unknown option
+    ;;
+esac
+done;
+
+function error_and_exit(){
+  echo " ! [fastlane rejected] ${CURRENT_BRANCH_NAME}"
+  echo "error: $1"
+  exit 1
+}
+
+function validate_required_version(){
+  if [[ -n $USE_TEST_JENKINS ]]; then
+    echo "Using test environment"
+    local FL_VERSION_URL="https://test-jenkins.example.com"
+  else
+    local FL_VERSION_URL="https://jenkins.example.com.com"
+  fi
+  local FL_VERSION_URL+="/fastlaneConfig/api/json"
+  local STATUS=$(curl -s -w %{http_code} $FL_VERSION_URL -o /dev/null)
+  if [[ $STATUS != "200" ]]; then
+    error_and_exit "Unable to find required FastLane config script @ ${FL_VERSION_URL} - Aborting. Use -f flag to force. HTTP Response code: ${STATUS}"
+  fi
+  local EXPECTED_VERSION=$(curl -s $FL_VERSION_URL --connect-timeout 5 | python -c 'import json,sys;obj=json.load(sys.stdin);print obj["version"]')
+  if [[ $SCRIPT_VERSION != $EXPECTED_VERSION ]]; then
+    error_and_exit "Your script version [${SCRIPT_VERSION}] is out of date. You must be running version [${EXPECTED_VERSION}]"
+  fi
+}
+
+# Always Error out if jenkins is requiring a newer version
+if [[ -z $FORCE ]]; then
+  validate_required_version
+fi
+
+if [[ -n $PRINT_VERSION ]]; then
+  echo "git fastlane version: ${SCRIPT_VERSION}"
+  validate_required_version
+  exit
+fi
+
+if [[ -n $BRANCH ]]; then
+  echo "fastlane: creating branch $BRANCH from origin/production"
+  git fetch --prune
+  BRANCH_NAME=$(git check-ref-format --branch $BRANCH) || error_and_exit "Invalid branch name: '$BRANCH'"
+  git checkout -b $BRANCH_NAME origin/production
+  git push -u origin $BRANCH_NAME
+  echo 'Success'
+  exit
+fi
+
+if [[ -n $SHOW_HELP ]]; then
+cat << EOF
+usage: git fastlane [-v|--version] [-h|--help] [-d|--dry-run]
+  [-b|--branch <branchname>] [-f|--force]
+
+Common uses:
+   To create a new branch for ticket 'SSD-101':
+    $ git fastlane -b SSD-101
+
+   To push your fastlane branch to production:
+    $ git fastlane
+
+EOF
+  exit
+fi
+
+
+
+# Start normal no parameter application
+# The git fetch is FIRST to assure you can access the repo while
+# this is running.
+git fetch --tags
+
+
+# Build variables
+CURRENT_BRANCH_NAME=$(git name-rev HEAD 2> /dev/null | awk "{ print \$2 }")
+
+# Find the current git repo from the output of the 'git remote' command -
+# which is unfortunately the only way to do this. Then, we need to remove the
+# '.git' from the URL, or else Jenkins will not trigger
+RAW_REPO_URL=$(git remote show -n origin | egrep -m1 -o '(ssh://)?[a-zA-Z0-9_-]+@[a-zA-Z0-9\.-]+:[a-zA-Z0-9/_-]+(.git)?')
+CURRENT_REPO_URL=${RAW_REPO_URL%.git}
+
+# Start actions
+echo "Current branch:   ${CURRENT_BRANCH_NAME}"
+echo "Current repo:     ${CURRENT_REPO_NAME}"
+echo "Checking workspace..."
+
+# Check that the branch isn't special branch names
+if [[ $CURRENT_BRANCH_NAME == "master" || $CURRENT_BRANCH_NAME == "deploy"
+  || $CURRENT_BRANCH_NAME == "test" || $CURRENT_BRANCH_NAME == "production" ]]; then
+  error_and_exit "You can not run fastlane on the ${CURRENT_BRANCH_NAME} branch"
+  exit 1
+fi
+
+if [[ -n $(git log @{u}..) ]]; then
+  error_and_exit 'Your local workspace contains commits not yet in origin. Please get these reviewed and commited before using fastlane'
+  exit 1
+fi
+
+#Assume the current branch name is the relevant JIRA ticket to use for
+# a git tag
+JIRA_TICKET=$CURRENT_BRANCH_NAME
+TAGNAME="fastlane-"
+TAGNAME+=$USER
+TAGNAME+="-"
+TAGNAME+=$JIRA_TICKET
+
+echo Finding a unique tag name to push to remote
+
+# We need a unique tag name so start putting numbers on the end
+# of it if it exists until we hit a number which doesnt exist yet
+i=1
+ORIGINAL_TAGNAME=$TAGNAME
+while git rev-parse $TAGNAME >/dev/null 2>&1
+do
+  TAGNAME=$ORIGINAL_TAGNAME
+  TAGNAME+="-"
+  TAGNAME+=$( printf '%d' $i)
+  i=$((i + 1))
+done
+
+echo "Using tag ${TAGNAME}"
+
+if [[ -n $DRY_RUN ]]; then
+  echo "Dry run - not pushing"
+  echo "git tag ${TAGNAME}"
+  echo "git push origin ${TAGNAME}"
+else
+  git tag $TAGNAME
+  git push origin $TAGNAME
+fi
+
+echo Force polling on commit stage...
+sleep 5s
+
+if [[ -n $USE_TEST_JENKINS ]]; then
+  echo "Using test environment"
+  TRIGGER_URL="https://test-jenkins.example.com/git/notifyCommit?url=${CURRENT_REPO_URL}"
+else
+  TRIGGER_URL="https://jenkins.example.com/git/notifyCommit?url=${CURRENT_REPO_URL}"
+fi
+
+CURL_JENKINS_OUTPUT=$(curl --fail --silent $TRIGGER_URL)
+echo -e "Forced poll @ ${TRIGGER_URL}\n# Jenkins Response\n${CURL_JENKINS_OUTPUT}\n# End"
+
+echo Success
